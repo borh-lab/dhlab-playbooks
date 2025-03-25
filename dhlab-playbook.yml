@@ -79,6 +79,7 @@
         name:
           ## MacOS devops
           - mas
+          - go
           # Standard developer tools and libraries
           - git
           - autoconf
@@ -273,6 +274,29 @@
       become_user: "{{ admin_user }}"
       tags: [ r ]
       # install.packages("RMeCab", repos = "http://rmecab.jp/R", type = "source") TODO
+
+    - name: Install Tailscale CLI tools
+      community.general.homebrew:
+        state: latest
+        name: tailscale
+      become_user: "{{ admin_user }}"
+      tags: [tailscale]
+
+    - name: Start Tailscale service
+      command: /opt/homebrew/bin/brew services start tailscale
+      become: yes
+      changed_when: false
+      tags: [tailscale]
+
+    - name: Authenticate Tailscale
+      command: /opt/homebrew/bin/tailscale up --auth-key {{ tailscale_auth_key }}
+      become_user: "{{ admin_user }}"
+      no_log: true
+      tags: [tailscale]
+      register: tailscale_auth
+      changed_when: "'Success' in tailscale_auth.stdout"
+      async: 45  # Allow time for Tailscale to initialize
+      poll: 5
 
     # Casual* apps must be converted from dmg to .app and places under files/dist
     - name: Install Casual* software

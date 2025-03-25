@@ -17,6 +17,9 @@ ansible-playbook -i inventory/imacs dhlab-playbook.yml --ask-become-pass
 
 Key tagged operations:
 ```bash
+# Tailscale VPN setup
+ansible-playbook -i inventory/imacs dhlab-playbook.yml --tags tailscale
+
 # Brew package management
 ansible-playbook -i inventory/imacs dhlab-playbook.yml --tags brew
 
