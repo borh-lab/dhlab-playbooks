@@ -1,0 +1,338 @@
+---
+- hosts: imacs
+  become: no
+  gather_facts: false
+  vars:
+    ansible_user: "{{ admin_user }}"
+  tasks:
+    - include_vars: vaults/credentials.yml
+      no_log: true
+  tags: [ always ]
+
+- hosts: imacs
+  collections:
+    - community.general.homebrew_cask
+    - community.general.homebrew
+  tasks:
+    - name: Set authorized key for admin user
+      authorized_key:
+        user: "{{ admin_user }}"
+        state: present
+        key: "{{ item }}"
+      with_file:
+        - 'files/ansible_deploy_user.pub'
+      tags: [ ssh ]
+
+    - name: Disable validate negotiate requests from SMB for performance
+      lineinfile:
+        path: /etc/nsmb.conf
+        regexp: '^validate_neg_off'
+        insertafter: '^\[default\]'
+        line: 'validate_neg_off=yes'
+        state: present
+      ignore_errors: yes
+      tags: [ network ]
+
+    # TODO: Outdated but maybe still relevant in parts
+    # https://mediawiki.middlebury.edu/LIS/Advanced_Mac_Configuration_Topics
+
+    - name: Allow 'wheel' group to have passwordless sudo
+      lineinfile:
+        dest: /etc/sudoers
+        state: present
+        regexp: '^%wheel'
+        line: '%wheel ALL=(ALL) NOPASSWD: ALL'
+        validate: '/usr/sbin/visudo -cf %s'
+      become: yes
+      tags: [ sudo ]
+
+    - name: Accept xcode license
+      command: xcodebuild -license accept
+      become: yes
+      tags: [ xcode ]
+
+    # - name: Install
+
+    - name: Install Homebrew in unattended mode
+      shell: NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install.sh)"
+      args:
+        creates: /opt/homebrew
+      become_user: "{{ admin_user }}"
+      tags: [ brew ]
+
+    - name: "Run this task before homebrew module, so that sudo cache gets refreshed."
+      command: "echo none"
+      become: yes
+      tags: [ brew ]
+
+    - name: Update homebrew and upgrade all packages
+      community.general.homebrew:
+        update_homebrew: yes
+        upgrade_all: yes
+      become_user: "{{ admin_user }}"
+      ignore_errors: yes
+      tags: [ brew ]
+
+    - name: Install packages
+      community.general.homebrew:
+        state: latest
+        name:
+          ## MacOS devops
+          - mas
+          # Standard developer tools and libraries
+          - git
+          - autoconf
+          - glib
+          - gettext
+          - xz
+          - gdbm
+          - pcre
+          - wget
+          - curl
+          - gcc
+          - cmake
+          - htop
+          - nmap
+          - openblas
+          - openssl
+          - sqlite
+          - openssh
+          - python
+          - ipython
+          - node
+          - vim
+          - emacs
+          - tmux
+          - tree
+          - readline
+          - ripgrep
+          - fd
+          - fish
+          # NLP
+          - mecab
+          # FIXME Use the newer UniDic releases from NINJAL
+          - mecab-unidic-extended
+          - mecab-ipadic
+          - mallet
+          - stanford-corenlp
+          # Misc
+          - pandoc
+          - jupyterlab
+          - uv
+          - rust
+          # R deps
+          - gsl
+          - open-mpi
+          - tcl-tk
+      become_user: "{{ admin_user }}"
+      ignore_errors: yes
+      tags: [ brew, temp ]
+
+    - name: Set up mecab dictionary
+      copy:
+        dest: /opt/homebrew/etc/mecabrc
+        content: |
+          dicdir = /opt/homebrew/lib/mecab/dic/unidic-extended
+      tags: [ mecab ]
+
+    - name: Tap homebrew repos (fonts)
+      command: /opt/homebrew/bin/brew tap homebrew/cask-fonts
+      become_user: "{{ admin_user }}"
+      tags: [ cask ]
+
+    - name: "Run this task before homebrew_cask module, so that sudo cache gets refreshed."
+      command: "echo none"
+      become: yes
+      tags: [ cask ]
+
+    - name: Upgrade all casks
+      community.general.homebrew_cask:
+        upgrade_all: true
+      become_user: "{{ admin_user }}"
+      tags: [ cask ]
+
+    ## Uncomment if needed:
+    #- name: Remove casks
+    #  community.general.homebrew_cask:
+    #    state: removed
+    #    name:
+    #      - osquery
+    #      - adoptopenjdk
+    #      - oracle-jdk
+    #  become_user: "{{ admin_user }}"
+    #  ignore_errors: yes
+    #  tags: [ cask, cask_remove ]
+
+    - name: Install cask packages
+      community.general.homebrew_cask:
+        state: latest # upgraded
+        greedy: yes
+        accept_external_apps: yes
+        # sudo_password: '{{ ansible_become_pass }}'
+        name:
+          - xquartz
+          - anaconda
+          # - mactex # Big download so fails sometimes...
+          - iterm2
+          - emacs
+          - visual-studio-code
+          - textmate
+          - font-sarasa-gothic # requires homebrew/cask-fonts
+          - meld
+          # - adobe-acrobat-reader
+          - zulu@8 # arm64 jdk 8
+          - r
+          - rstudio
+          - julia
+          - dropbox
+          - bbedit
+          - coteditor
+          - zoom
+      become_user: "{{ admin_user }}"
+      register: cask_result
+      ignore_errors: yes
+      tags: [ cask, cask_install ]
+
+    # TODO: Is this needed?
+    #- name: Set up permissions for multiuser access
+    #  command: "chmod -R g+rx /Applications/{{ item }}"
+    #  become: yes
+    #  loop: # TODO should be expanded to all casks?
+    #    - Emacs.app
+    #    - Firefox.app
+    #    - MacDown.app
+    #    - Meld.app
+    #    - RStudio.app
+    #    - Slack.app
+    #    - TextMate.app
+    #  ignore_errors: yes
+    #  tags: [ cask_fix, cask, cask_install ]
+
+    - set_fact:
+        manual_app: "{{ cask_result.msg | regex_replace(\"Error: It seems there is already an App at '(.+\\.app)'\\.\", '\\1') }}"
+      when: cask_result.failed
+      changed_when: cask_result.failed
+      notify: Delete manual apps
+      tags: [ cask ]
+
+    - name: Brew cleanup
+      command: /opt/homebrew/bin/brew cleanup
+      become_user: "{{ admin_user }}"
+      tags: [ brew ]
+
+    - name: Update R packages
+      command: R --quiet -e "update.packages(ask = FALSE, repos = c('https://cran.ism.ac.jp/'))"
+      become_user: "{{ admin_user }}"
+      tags: [ r ]
+
+    - name: Install R packages
+      command: R --quiet -e "if (! '{{ item }}' %in% installed.packages()[,'Package']) install.packages('{{ item }}', repos=c('https://cran.ism.ac.jp/'))"
+      with_items:
+        - devtools
+        - tidyverse
+        - shiny
+        - randomForest
+        - caret
+        - plyr
+        - MASS
+        - lattice
+        - nlme
+        - data.table
+        - rpart
+        - forestRK
+        - greenclust
+        - mlr3
+        - borrowr
+        - modelsummary
+        - altair
+        - ggparty
+        # For CasualConc
+        - igraph
+        - wordcloud
+        - fmsb
+        - maptools
+        - amap
+        - car
+        - scales
+        - hash
+        - compute.es
+        - scatterplot3d
+        - psych
+        - GPArotation
+        - coin
+        - extractRankTests
+        - gplots
+        - party
+        - proxy
+        - pvclust
+        - FactoMineR
+        - beeswarm
+        - vioplot
+        - beanplot
+        - ape
+      become_user: "{{ admin_user }}"
+      tags: [ r ]
+      # install.packages("RMeCab", repos = "http://rmecab.jp/R", type = "source") TODO
+
+    # Casual* apps must be converted from dmg to .app and places under files/dist
+    - name: Install Casual* software
+      copy:
+        src: 'files/dist/{{ item }}'
+        dest: '/Applications/'
+      loop:
+        - CasualConc.app
+        # - CasualPConc.app
+        - CasualTagger.app
+        # - CasualTextractor.app
+        # - CasualTranscriber.app
+        # - CasualTreeTagger.app
+      tags: [ casual ]
+
+    - name: Set correct permissions for moved apps
+      file:
+        path: '/Applications/{{ item }}/Contents/MacOS/'
+        mode: +x
+        recurse: yes
+      loop:
+        - CasualConc.app
+        - CasualPConc.app
+        - CasualTagger.app
+        - CasualTextractor.app
+        - CasualTranscriber.app
+        - CasualTreeTagger.app
+      tags: [ casual ]
+
+    # https://github.com/geerlingguy/ansible-collection-mac/blob/master/roles/mas/tasks/main.yml
+    - name: Check App Store login status for mas
+      command: mas account
+      register: mas_account_result
+      failed_when: mas_account_result.rc > 1
+      check_mode: false
+      changed_when: false
+      tags: [ mas, system_update ]
+
+    - name: Update all apps in App Store
+      command: mas upgrade
+      tags: [ mas, system_update ]
+      when:
+        - mas_account_result.rc == 1
+      ignore_errors: yes
+      tags: [ mas, system_update ]
+
+    - name: Update all software and restart if necessary
+      command: softwareupdate -i -a --restart
+      tags: [ system_update ]
+
+  handlers:
+    # Trigger hook to rm -rf offending app and restart above task
+    - name: Delete manual apps
+      file:
+        path: '{{ manual_app }}'
+        state: absent
+      when: cask_result.failed and manual_app != ""
+      tags: [ cask ]
+
+    - name: Reboot system
+      command: /sbin/shutdown -r now
+
+  # TODO https://docs.ansible.com/ansible/latest/modules/osx_defaults_module.html
