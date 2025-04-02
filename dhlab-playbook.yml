@@ -1,86 +1,125 @@
 ---
-- hosts: imacs
-  become: no
+- name: Load credentials
+  hosts: [imacs, unifi]
+  become: false
   gather_facts: false
-  vars:
-    ansible_user: "{{ admin_user }}"
   tasks:
-    - include_vars: vaults/credentials.yml
-      no_log: true
-  tags: [ always ]
+    - name: Include vault credentials
+      ansible.builtin.include_vars:
+        file: vaults/credentials.yml
+      no_log: false # true
+      tags: [always]
 
-- hosts: imacs
-  collections:
-    - community.general.homebrew_cask
-    - community.general.homebrew
+- name: Configure macOS workstations
+  hosts: [imacs, unifi]
+  gather_facts: false # Disable implicit fact gathering
+  pre_tasks:
+    - name: Ensure pexpect is installed for expect module
+      ansible.builtin.pip:
+        name: pexpect
+        state: present
+      become: true
+      tags: [always] # Ensure it runs even if only other tags are specified initially
+
+    - name: Accept xcode license
+      ansible.builtin.command: sudo xcodebuild -license accept
+      become: true
+      changed_when: false
+      tags: [xcode, always] # Ensure it runs even if only other tags are specified initially
+
+    - name: Explicitly gather facts after accepting license
+      ansible.builtin.setup:
+      tags: [always] # Ensure facts are gathered
+
   tasks:
-    - name: Set authorized key for admin user
-      authorized_key:
-        user: "{{ admin_user }}"
-        state: present
-        key: "{{ item }}"
-      with_file:
-        - 'files/ansible_deploy_user.pub'
-      tags: [ ssh ]
+    # - name: Set authorized key for admin user
+    #   ansible.posix.authorized_key:
+    #     user: "{{ admin_user }}"
+    #     state: present
+    #     key: "{{ item }}"
+    #   with_file:
+    #     - 'files/ansible_deploy_user.pub'
+    #   tags: [ssh]
 
-    - name: Disable validate negotiate requests from SMB for performance
-      lineinfile:
-        path: /etc/nsmb.conf
-        regexp: '^validate_neg_off'
-        insertafter: '^\[default\]'
-        line: 'validate_neg_off=yes'
-        state: present
-      ignore_errors: yes
-      tags: [ network ]
+    # - name: Disable validate negotiate requests from SMB for performance
+    #   ansible.builtin.lineinfile:
+    #     path: /etc/nsmb.conf
+    #     regexp: '^validate_neg_off'
+    #     insertafter: '^\[default\]'
+    #     line: 'validate_neg_off=yes'
+    #     state: present
+    #   failed_when: false
+    #   tags: [network]
 
-    # TODO: Outdated but maybe still relevant in parts
-    # https://mediawiki.middlebury.edu/LIS/Advanced_Mac_Configuration_Topics
+
+    - name: Add admin user to wheel
+      ansible.builtin.user:
+        name: "{{ admin_user }}"
+        groups: wheel
+        append: true
+      tags: [setup_all,sudo]
 
     - name: Allow 'wheel' group to have passwordless sudo
-      lineinfile:
+      ansible.builtin.lineinfile:
         dest: /etc/sudoers
         state: present
         regexp: '^%wheel'
         line: '%wheel ALL=(ALL) NOPASSWD: ALL'
         validate: '/usr/sbin/visudo -cf %s'
-      become: yes
-      tags: [ sudo ]
+      become: true
+      tags: [setup_all,sudo]
 
-    - name: Accept xcode license
-      command: xcodebuild -license accept
-      become: yes
-      tags: [ xcode ]
 
-    # - name: Install
+    - name: Install commandline tools
+      ansible.builtin.command: xcode-select --install
+      become: true
+      changed_when: false
+      tags: [setup_all,xcode]
 
     - name: Install Homebrew in unattended mode
-      shell: NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install.sh)"
+      ansible.builtin.shell: |
+        NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install.sh)"
       args:
         creates: /opt/homebrew
+      become: true
       become_user: "{{ admin_user }}"
-      tags: [ brew ]
+      tags: [setup_all,brew]
 
-    - name: "Run this task before homebrew module, so that sudo cache gets refreshed."
-      command: "echo none"
-      become: yes
-      tags: [ brew ]
+    # Run a trivial sudo command to refresh the sudo timestamp,
+    # preventing potential prompts during the following Homebrew tasks run as admin_user.
+    - name: Run sudo cache refresh for homebrew
+      ansible.builtin.command: echo none
+      become: true
+      changed_when: false
+      tags: [setup_all,brew]
 
     - name: Update homebrew and upgrade all packages
       community.general.homebrew:
-        update_homebrew: yes
-        upgrade_all: yes
+        update_homebrew: true
+        upgrade_all: true
+      become: true
       become_user: "{{ admin_user }}"
-      ignore_errors: yes
-      tags: [ brew ]
+      failed_when: false
+      tags: [setup_all,brew]
+
+    - name: Install Rosetta 2
+      ansible.builtin.command: /usr/sbin/softwareupdate --install-rosetta --agree-to-license
+      become: true
+      register: rosetta_install_result
+      # Changed if the output indicates successful installation
+      changed_when: "'Install of Rosetta 2 finished successfully' in rosetta_install_result.stdout"
+      # Don't fail if already installed (rc=1, specific stderr), fail on other errors
+      failed_when:
+        - rosetta_install_result.rc != 0
+        - not ('Rosetta 2 is already installed.' in rosetta_install_result.stderr and rosetta_install_result.rc == 1)
+      tags: [setup_all, system_setup, rosetta]
 
     - name: Install packages
       community.general.homebrew:
         state: latest
         name:
-          ## MacOS devops
           - mas
           - go
-          # Standard developer tools and libraries
           - git
           - autoconf
           - glib
@@ -93,6 +132,7 @@
           - gcc
           - cmake
           - htop
+          - btop
           - nmap
           - openblas
           - openssl
@@ -111,9 +151,6 @@
           - fish
           # NLP
           - mecab
-          # FIXME Use the newer UniDic releases from NINJAL
-          - mecab-unidic-extended
-          - mecab-ipadic
           - mallet
           - stanford-corenlp
           # Misc
@@ -125,173 +162,287 @@
           - gsl
           - open-mpi
           - tcl-tk
+      become: true
       become_user: "{{ admin_user }}"
-      ignore_errors: yes
-      tags: [ brew, temp ]
+      failed_when: false
+      tags: [setup_all, brew]
 
-    - name: Set up mecab dictionary
-      copy:
+    - name: Define UniDic URLs
+      ansible.builtin.set_fact:
+        unidic_urls:
+          gendai: "https://clrd.ninjal.ac.jp/unidic_archive/2302/unidic-cwj-202302.zip"
+          novel: "https://clrd.ninjal.ac.jp/unidic_archive/2203/UniDic-202203_65_novel.zip"
+        unidic_dirs:
+          gendai: "unidic-cwj-202302"
+          novel: "UniDic-202203_65_novel"
+      tags: [setup_all, mecab]
+
+    - name: Create shared mecab dictionary directory
+      ansible.builtin.file:
+        path: /Users/Shared/mecab
+        state: directory
+        mode: '0775'
+        owner: "{{ admin_user }}"
+        group: staff
+      become: true
+      tags: [setup_all, mecab]
+
+    - name: Download UniDic Gendai dictionary using curl
+      ansible.builtin.command: "curl -L -o /tmp/unidic-gendai.zip {{ unidic_urls.gendai }}"
+      args:
+        creates: "/Users/Shared/mecab/{{ unidic_dirs.gendai }}"
+      become: true
+      become_user: "{{ admin_user }}"
+      register: gendai_download
+      changed_when: gendai_download.rc == 0 and not ('already exists' in gendai_download.stdout)
+      tags: [setup_all, mecab]
+
+    - name: Unarchive local UniDic Gendai dictionary
+      ansible.builtin.unarchive:
+        src: /tmp/unidic-gendai.zip
+        dest: /Users/Shared/mecab/
+        remote_src: true
+        creates: "/Users/Shared/mecab/{{ unidic_dirs.gendai }}"
+        owner: "{{ admin_user }}"
+        group: staff
+      become: true
+      when: gendai_download.changed or not gendai_download.skipped
+      tags: [setup_all, mecab]
+
+    - name: Download UniDic Novel dictionary using curl
+      ansible.builtin.command: "curl -L -o /tmp/unidic-novel.zip {{ unidic_urls.novel }}"
+      args:
+        creates: "/Users/Shared/mecab/{{ unidic_dirs.novel }}"
+      become: true
+      become_user: "{{ admin_user }}"
+      register: novel_download
+      changed_when: novel_download.rc == 0 and not ('already exists' in novel_download.stdout)
+      tags: [setup_all, mecab]
+
+    - name: Unarchive local UniDic Novel dictionary
+      ansible.builtin.unarchive:
+        src: /tmp/unidic-novel.zip
+        dest: /Users/Shared/mecab/
+        remote_src: true
+        creates: "/Users/Shared/mecab/{{ unidic_dirs.novel }}"
+        owner: "{{ admin_user }}"
+        group: staff
+      become: true
+      when: novel_download.changed or not novel_download.skipped
+      tags: [setup_all, mecab]
+
+    - name: Clean up downloaded dictionary zip files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/unidic-gendai.zip
+        - /tmp/unidic-novel.zip
+      become: true
+      tags: [setup_all, mecab]
+
+    - name: Ensure correct permissions for shared dictionaries
+      ansible.builtin.file:
+        path: /Users/Shared/mecab
+        state: directory
+        recurse: true
+        mode: "a+rX"
+      become: true
+      tags: [setup_all, mecab]
+
+    - name: Configure mecabrc to use shared Gendai dictionary by default
+      ansible.builtin.copy:
         dest: /opt/homebrew/etc/mecabrc
-        content: |
-          dicdir = /opt/homebrew/lib/mecab/dic/unidic-extended
-      tags: [ mecab ]
+        content: "dicdir = /Users/Shared/mecab/{{ unidic_dirs.gendai }}"
+        mode: '0644'
+        owner: root
+        group: wheel
+      become: true
+      tags: [setup_all, mecab]
 
-    - name: Tap homebrew repos (fonts)
-      command: /opt/homebrew/bin/brew tap homebrew/cask-fonts
-      become_user: "{{ admin_user }}"
-      tags: [ cask ]
 
-    - name: "Run this task before homebrew_cask module, so that sudo cache gets refreshed."
-      command: "echo none"
-      become: yes
-      tags: [ cask ]
+    # Refresh sudo timestamp again before running Cask operations.
+    - name: Refresh sudo cache for cask
+      ansible.builtin.command: echo none
+      become: true
+      changed_when: false
+      tags: [setup_all, cask]
 
     - name: Upgrade all casks
       community.general.homebrew_cask:
         upgrade_all: true
+        install_options: force
+      become: true
       become_user: "{{ admin_user }}"
-      tags: [ cask ]
+      tags: [setup_all, cask]
 
     ## Uncomment if needed:
-    #- name: Remove casks
-    #  community.general.homebrew_cask:
-    #    state: removed
-    #    name:
-    #      - osquery
-    #      - adoptopenjdk
-    #      - oracle-jdk
-    #  become_user: "{{ admin_user }}"
-    #  ignore_errors: yes
-    #  tags: [ cask, cask_remove ]
+    # - name: Remove casks
+    #   community.general.homebrew_cask:
+    #     state: removed
+    #     name:
+    #       - osquery
+    #       - adoptopenjdk
+    #       - oracle-jdk
+    #   become_user: "{{ admin_user }}"
+    #   ignore_errors: yes
+    #   tags: [ cask, cask_remove ]
 
     - name: Install cask packages
       community.general.homebrew_cask:
-        state: latest # upgraded
-        greedy: yes
-        accept_external_apps: yes
-        # sudo_password: '{{ ansible_become_pass }}'
+        state: latest
+        greedy: true
         name:
-          - xquartz
+          # - xquartz
           - anaconda
-          # - mactex # Big download so fails sometimes...
-          - iterm2
-          - emacs
-          - visual-studio-code
-          - textmate
-          - font-sarasa-gothic # requires homebrew/cask-fonts
-          - meld
-          # - adobe-acrobat-reader
-          - zulu@8 # arm64 jdk 8
-          - r
-          - rstudio
-          - julia
-          - dropbox
           - bbedit
           - coteditor
+          - docker
+          - dropbox
+          - emacs
+          - font-sarasa-gothic
+          - google-chrome
+          - iterm2
+          - julia
+          - meld
+          - r
+          - rstudio
+          - textmate
+          - visual-studio-code
           - zoom
+          - zulu@8
+        install_options: "force"
+        accept_external_apps: true
+      become: true
       become_user: "{{ admin_user }}"
       register: cask_result
-      ignore_errors: yes
-      tags: [ cask, cask_install ]
+      ignore_errors: true
+      tags: [setup_all, cask, cask_install]
 
-    # TODO: Is this needed?
-    #- name: Set up permissions for multiuser access
-    #  command: "chmod -R g+rx /Applications/{{ item }}"
-    #  become: yes
-    #  loop: # TODO should be expanded to all casks?
-    #    - Emacs.app
-    #    - Firefox.app
-    #    - MacDown.app
-    #    - Meld.app
-    #    - RStudio.app
-    #    - Slack.app
-    #    - TextMate.app
-    #  ignore_errors: yes
-    #  tags: [ cask_fix, cask, cask_install ]
+    # Add space after #
+    # - name: Set up permissions for multiuser access
+    #   command: "chmod -R g+rx /Applications/{{ item }}"
+    #   become: yes
+    #   loop: # TODO should be expanded to all casks?
+    #     - Emacs.app
+    #     - Firefox.app
+    #     - MacDown.app
+    #     - Meld.app
+    #     - RStudio.app
+    #     - Slack.app
+    #     - TextMate.app
+    #   ignore_errors: yes
+    #   tags: [cask_fix, cask, cask_install]
 
-    - set_fact:
-        manual_app: "{{ cask_result.msg | regex_replace(\"Error: It seems there is already an App at '(.+\\.app)'\\.\", '\\1') }}"
+    # If a cask installation failed because a file already exists (e.g., from a previous
+    # manual install or different cask), extract the conflicting path using regex
+    # based on the expected homebrew-cask error message format. This path will be
+    # used by the 'Delete conflicting paths' handler.
+    - name: Extract conflicting path
+      ansible.builtin.set_fact:
+        manual_app: "{{ cask_result.msg | regex_replace('Error: It seems there is already a (Binary|App) at ''(.+)''\\.', '\\2') }}"
       when: cask_result.failed
       changed_when: cask_result.failed
-      notify: Delete manual apps
-      tags: [ cask ]
+      notify: Delete conflicting paths
+      tags: [setup_all, cask]
+
+    # - name: Cleanup potential conflicts
+    #   ansible.builtin.command: |
+    #     rm /opt/homebrew/bin/{{ item }}
+    #   become: true
+    #   become_user: "{{ admin_user }}"
+    #   loop:
+    #     - emacs
+    #     - emacsclient
+    #     - ebrowse
+    #     - etags
+    #   ignore_errors: true
+    #   tags: [delete]
 
     - name: Brew cleanup
-      command: /opt/homebrew/bin/brew cleanup
+      ansible.builtin.command: /opt/homebrew/bin/brew cleanup
+      become: true
       become_user: "{{ admin_user }}"
-      tags: [ brew ]
+      changed_when: false
+      tags: [setup_all, brew]
 
     - name: Update R packages
-      command: R --quiet -e "update.packages(ask = FALSE, repos = c('https://cran.ism.ac.jp/'))"
+      ansible.builtin.command: R --quiet -e "update.packages(ask = FALSE, repos = c('https://cran.ism.ac.jp/'))"
+      become: true
       become_user: "{{ admin_user }}"
-      tags: [ r ]
+      changed_when: false
+      tags: [setup_all, r]
 
-    - name: Install R packages
-      command: R --quiet -e "if (! '{{ item }}' %in% installed.packages()[,'Package']) install.packages('{{ item }}', repos=c('https://cran.ism.ac.jp/'))"
-      with_items:
-        - devtools
-        - tidyverse
-        - shiny
-        - randomForest
-        - caret
-        - plyr
-        - MASS
-        - lattice
-        - nlme
-        - data.table
-        - rpart
-        - forestRK
-        - greenclust
-        - mlr3
-        - borrowr
-        - modelsummary
-        - altair
-        - ggparty
-        # For CasualConc
-        - igraph
-        - wordcloud
-        - fmsb
-        - maptools
-        - amap
-        - car
-        - scales
-        - hash
-        - compute.es
-        - scatterplot3d
-        - psych
-        - GPArotation
-        - coin
-        - extractRankTests
-        - gplots
-        - party
-        - proxy
-        - pvclust
-        - FactoMineR
-        - beeswarm
-        - vioplot
-        - beanplot
-        - ape
+    - name: Prepare R package installation script
+      ansible.builtin.copy:
+        dest: "/tmp/install_r_packages.R"
+        content: |
+          # List of required packages
+          required_packages <- c(
+            "devtools", "tidyverse", "shiny", "randomForest", "caret", "plyr",
+            "MASS", "lattice", "nlme", "data.table", "rpart", "forestRK",
+            "greenclust", "mlr3", "borrowr", "modelsummary", "altair", "ggparty",
+            # For CasualConc
+            "igraph", "wordcloud", "fmsb", "maptools", "amap", "car", "scales",
+            "hash", "compute.es", "scatterplot3d", "psych", "GPArotation", "coin",
+            "extractRankTests", "gplots", "party", "proxy", "pvclust", "FactoMineR",
+            "beeswarm", "vioplot", "beanplot", "ape"
+            # TODO: "RMeCab" requires special handling: install.packages("RMeCab", repos = "http://rmecab.jp/R", type = "source")
+          )
+
+          # Determine which packages are not already installed
+          installed_pkgs <- installed.packages()[,"Package"]
+          packages_to_install <- required_packages[!required_packages %in% installed_pkgs]
+
+          # Install missing packages
+          if (length(packages_to_install) > 0) {
+            print(paste("Installing packages:", paste(packages_to_install, collapse=", ")))
+            install.packages(packages_to_install, repos = c('https://cran.ism.ac.jp/'))
+            # Indicate that changes were made
+            quit(save = "no", status = 0) # Using status 0 to indicate potential change, Ansible will check stdout
+          } else {
+            print("All required R packages are already installed.")
+            # Indicate that no changes were needed
+            quit(save = "no", status = 1) # Using status 1 to indicate no change needed
+          }
+        mode: '0644'
+      become: true
       become_user: "{{ admin_user }}"
-      tags: [ r ]
-      # install.packages("RMeCab", repos = "http://rmecab.jp/R", type = "source") TODO
+      tags: [setup_all, r]
+
+    - name: Install R packages via script
+      ansible.builtin.command: Rscript /tmp/install_r_packages.R
+      become: true
+      become_user: "{{ admin_user }}"
+      register: r_install_result
+      # Changed if the script exited with status 0 (meaning it tried to install)
+      # We check stdout as well to ensure it actually printed the "Installing" message,
+      # as install.packages might fail silently sometimes depending on R config.
+      changed_when: r_install_result.rc == 0 and "Installing packages:" in r_install_result.stdout
+      failed_when: r_install_result.rc not in [0, 1] # Fail only if script error occurs (rc != 0 or 1)
+      tags: [setup_all, r]
 
     - name: Install Tailscale CLI tools
       community.general.homebrew:
         state: latest
         name: tailscale
+        force_formula: true
+      become: true
       become_user: "{{ admin_user }}"
       tags: [tailscale]
 
-    - name: Start Tailscale service
-      command: /opt/homebrew/bin/brew services start tailscale
-      become: yes
-      changed_when: false
+    - name: Install Tailscale system daemon
+      ansible.builtin.command: /opt/homebrew/bin/tailscaled install-system-daemon
+      become: true
+      args:
+        creates: /Library/LaunchDaemons/com.tailscale.tailscaled.plist
       tags: [tailscale]
 
     - name: Authenticate Tailscale
-      command: /opt/homebrew/bin/tailscale up --auth-key {{ tailscale_auth_key }}
+      ansible.builtin.command: /opt/homebrew/bin/tailscale up --auth-key {{ tailscale_auth_key }}
+      become: true
       become_user: "{{ admin_user }}"
-      no_log: true
+      no_log: false
       tags: [tailscale]
       register: tailscale_auth
       changed_when: "'Success' in tailscale_auth.stdout"
@@ -300,9 +451,10 @@
 
     # Casual* apps must be converted from dmg to .app and places under files/dist
     - name: Install Casual* software
-      copy:
+      ansible.builtin.copy:
         src: 'files/dist/{{ item }}'
         dest: '/Applications/'
+        mode: '0755'
       loop:
         - CasualConc.app
         # - CasualPConc.app
@@ -310,13 +462,13 @@
         # - CasualTextractor.app
         # - CasualTranscriber.app
         # - CasualTreeTagger.app
-      tags: [ casual ]
+      tags: [setup_all, casual]
 
     - name: Set correct permissions for moved apps
-      file:
+      ansible.builtin.file:
         path: '/Applications/{{ item }}/Contents/MacOS/'
-        mode: +x
-        recurse: yes
+        mode: '+x'
+        recurse: true
       loop:
         - CasualConc.app
         - CasualPConc.app
@@ -324,39 +476,103 @@
         - CasualTextractor.app
         - CasualTranscriber.app
         - CasualTreeTagger.app
-      tags: [ casual ]
+      tags: [setup_all, casual]
 
-    # https://github.com/geerlingguy/ansible-collection-mac/blob/master/roles/mas/tasks/main.yml
-    - name: Check App Store login status for mas
-      command: mas account
-      register: mas_account_result
-      failed_when: mas_account_result.rc > 1
-      check_mode: false
-      changed_when: false
-      tags: [ mas, system_update ]
+    - name: Ensure remote upload directory exists
+      ansible.builtin.file:
+        path: "/Users/{{ admin_user }}/uploads"
+        state: directory
+        owner: "{{ admin_user }}"
+        group: staff
+        mode: '0755'
+      become: true
+      tags: [setup_all, upload]
+
+    - name: Upload files from local 'upload' folder
+      ansible.builtin.copy:
+        src: upload/
+        dest: "/Users/{{ admin_user }}/uploads"
+        owner: "{{ admin_user }}"
+        group: staff
+        mode: '0644'
+      become: true
+      become_user: "{{ admin_user }}"
+      tags: [setup_all, upload]
+
 
     - name: Update all apps in App Store
-      command: mas upgrade
-      tags: [ mas, system_update ]
-      when:
-        - mas_account_result.rc == 1
-      ignore_errors: yes
-      tags: [ mas, system_update ]
+      ansible.builtin.command: mas upgrade
+      become: true
+      become_user: "{{ admin_user }}"
+      failed_when: false
+      changed_when: false
+      tags: [setup_all, mas]
 
-    - name: Update all software and restart if necessary
-      command: softwareupdate -i -a --restart
-      tags: [ system_update ]
+    - name: Ensure specific App Store applications are 'purchased' (for free apps)
+      ansible.builtin.command: "mas purchase {{ item }}"
+      loop:
+        - 462058435
+        - 462062816
+        - 462054704
+      become: true
+      become_user: "{{ admin_user }}"
+      register: mas_purchase_result
+      # Changed if mas reports 'Signing In' or 'Installed' (sometimes purchase triggers install)
+      changed_when: "'Signing In' in mas_purchase_result.stdout or 'Installed' in mas_purchase_result.stdout"
+      # Don't fail if already purchased/installed, but fail on other errors (like not being free or account issues)
+      failed_when:
+        - mas_purchase_result.rc != 0
+        - "'is already installed' not in mas_purchase_result.stderr"
+        - "'This item is already in your purchases' not in mas_purchase_result.stderr"
+        - "'This app is already installed' not in mas_purchase_result.stdout" # Another variation
+      tags: [setup_all, mas]
+
+    - name: Install specific App Store applications (MS Office)
+      ansible.builtin.command: "mas install {{ item }}"
+      loop:
+        - 462058435
+        - 462062816
+        - 462054704
+      become: true
+      become_user: "{{ admin_user }}"
+      register: mas_install_result
+      # Changed if mas reports 'Installed' or 'Installing'
+      changed_when: "'Installed' in mas_install_result.stdout or 'Installing' in mas_install_result.stdout"
+      # Don't fail if already installed, but fail on other errors
+      failed_when: mas_install_result.rc != 0 and 'is already installed' not in mas_install_result.stderr
+      tags: [setup_all, mas]
+
+
+    - name: Update all software and restart if necessary (using expect)
+      ansible.builtin.expect:
+        command: /usr/sbin/softwareupdate -i -a --restart
+        timeout: 3600 # Allow up to 1 hour
+        responses:
+          (?i)password: "{{ ansible_sudo_password }}"
+          (?i)installing: # Continue if it shows installation progress
+          (?i)requires that you restart: # Acknowledge restart message
+          (?i)found new software: # Continue if it finds software
+          (?i)no new software available: # End successfully if no updates
+      become: true
+      no_log: true # Hide password from logs
+      register: softwareupdate_result
+      changed_when: "'Installed' in softwareupdate_result.stdout or 'Installing' in softwareupdate_result.stdout"
+      # Fail only if the command itself errors unexpectedly, not just if no updates found or restart needed
+      failed_when: softwareupdate_result.rc != 0 and 'No new software available.' not in softwareupdate_result.stdout
+      tags: [setup_all, system_update]
 
   handlers:
     # Trigger hook to rm -rf offending app and restart above task
-    - name: Delete manual apps
-      file:
+    - name: Delete conflicting paths
+      ansible.builtin.file:
         path: '{{ manual_app }}'
         state: absent
-      when: cask_result.failed and manual_app != ""
-      tags: [ cask ]
+      become: true
+      when: manual_app != ""
+      tags: [setup_all, cask]
 
     - name: Reboot system
-      command: /sbin/shutdown -r now
+      ansible.builtin.command: /sbin/shutdown -r now
+      become: true
+      changed_when: false
 
-  # TODO https://docs.ansible.com/ansible/latest/modules/osx_defaults_module.html
