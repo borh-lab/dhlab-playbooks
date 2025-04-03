@@ -73,7 +73,14 @@
     - name: Install commandline tools
       ansible.builtin.command: xcode-select --install
       become: true
+      register: xcode_install_result
+      # Changed should remain false as this command only triggers an install prompt
+      # or confirms existing installation, it doesn't directly change state itself.
       changed_when: false
+      # Fail only if rc is non-zero AND the 'already installed' message isn't in stderr
+      failed_when:
+        - xcode_install_result.rc != 0
+        - "'already installed' not in xcode_install_result.stderr"
       tags: [setup_all,xcode]
 
     - name: Install Homebrew in unattended mode
@@ -452,16 +459,19 @@
     # Casual* apps must be converted from dmg to .app and places under files/dist
     - name: Install Casual* software
       ansible.builtin.copy:
-        src: 'files/dist/{{ item }}'
+        src: 'files/casual/{{ item }}'
         dest: '/Applications/'
         mode: '0755'
+        force: true
       loop:
         - CasualConc.app
+        - STFDB Creator.app
         # - CasualPConc.app
         - CasualTagger.app
-        # - CasualTextractor.app
-        # - CasualTranscriber.app
+        - CasualTextractor.app
+        - CasualTranscriber.app
         # - CasualTreeTagger.app
+        - IPATypist.app
       tags: [setup_all, casual]
 
     - name: Set correct permissions for moved apps
@@ -471,11 +481,13 @@
         recurse: true
       loop:
         - CasualConc.app
-        - CasualPConc.app
+        - STFDB Creator.app
+        # - CasualPConc.app
         - CasualTagger.app
         - CasualTextractor.app
         - CasualTranscriber.app
-        - CasualTreeTagger.app
+        # - CasualTreeTagger.app
+        - IPATypist.app
       tags: [setup_all, casual]
 
     - name: Ensure remote upload directory exists
@@ -490,7 +502,7 @@
 
     - name: Upload files from local 'upload' folder
       ansible.builtin.copy:
-        src: upload/
+        src: files/upload/
         dest: "/Users/{{ admin_user }}/uploads"
         owner: "{{ admin_user }}"
         group: staff
